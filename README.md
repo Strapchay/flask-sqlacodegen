@@ -1,10 +1,12 @@
 # Flask sqlacodegen
 
-Fork of [sqlacodegen](https://pypi.python.org/pypi/sqlacodegen) by Alex Gronholm.
+Fork of [flask-sqlacodegen](https://github.com/ksindi/flask-sqlacodegen) by @KINSHI of [sqlacodegen](https://pypi.python.org/pypi/sqlacodegen) by Alex Gronholm.
 
 What's different:
 
 * Support for Flask-SQLAlchemy syntax using `--flask` option.
+* Solves Argparse issues for users with python versions >3.10
+* Switches Enum logic to be class based instead of inline and then referencing the Enum class where needed
 * Defaults to generating backrefs in relationships. `--nobackref` still included as option in case backrefs are not wanted. 
 * Naming of backrefs is class name in snake_case (as opposed to CamelCase) and is pluralized if it's Many-to-One or Many-to-Many using [inflect](https://pypi.python.org/pypi/inflect).
 * Primary joins are explicit.
@@ -22,14 +24,14 @@ pip install flask-sqlacodegen
 
 Without pip:
 ```sh
-git clone https://github.com/ksindi/flask-sqlacodegen.git
+git clone https://github.com/strapchay/flask-sqlacodegen.git
 cd flask-sqlacodegen/
 python setup.py install
 ```
 
 For contributing:
 ```sh
-git clone https://github.com/ksindi/flask-sqlacodegen.git
+git clone https://github.com/strapchay/flask-sqlacodegen.git
 python -m venv env
 pip install -r requirements.txt
 python -m sqlacodegen.main --flask --outfile models.py mysql+pymysql://<username>:<password>@<database-ip>:<port>/<database-name> [--tables <tablenames>] [--notables]
