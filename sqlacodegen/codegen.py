@@ -1,5 +1,5 @@
+
 """Contains the code generation logic and helper functions."""
-from __future__ import unicode_literals, division, print_function, absolute_import
 from collections import defaultdict
 from keyword import iskeyword
 import inspect
@@ -115,6 +115,7 @@ def _render_column_type(codegen, coltype):
     prepend = 'db.' if codegen.flask else ''
     args = []
     if isinstance(coltype, Enum):
+        # Use the registered enum name directly
         if coltype.name in codegen.enum_registry.values():
             return f"{prepend}Enum({coltype.name})"
         else:
@@ -153,7 +154,6 @@ def _render_column_type(codegen, coltype):
     if args:
         text += '({0})'.format(', '.join(args))
     return text
-
 
 def _render_column(self, column, show_name):
     prepend = 'db.' if self.codegen.flask else ''
@@ -200,7 +200,7 @@ def _render_constraint(constraint):
     else:
         table = constraint.table  # Other constraints (e.g., ForeignKeyConstraint) have a table attribute
     prepend = 'db.' if hasattr(table, '_codegen') and table._codegen.flask else ''
-    
+
     def render_fk_options(*opts):
         opts = [repr(opt) for opt in opts]
         for attr in 'ondelete', 'onupdate', 'deferrable', 'initially', 'match':
@@ -246,12 +246,10 @@ def _render_index(index):
 class ImportCollector(OrderedDict):
     def add_import(self, obj):
         type_ = type(obj) if not isinstance(obj, type) else obj
-        # For SQLAlchemy 2.x compatibility, avoid __all__ and use module directly
         if type_.__module__.startswith('sqlalchemy'):
             pkgname = type_.__module__
-            # Common types that should come from top-level 'sqlalchemy'
-            top_level_types = {'Column', 'Table', 'ForeignKey', 'ForeignKeyConstraint', 'CheckConstraint', 
-                              'UniqueConstraint', 'Index', 'Enum', 'ARRAY', 'Boolean', 'String', 'Integer', 
+            top_level_types = {'Column', 'Table', 'ForeignKey', 'ForeignKeyConstraint', 'CheckConstraint',
+                              'UniqueConstraint', 'Index', 'Enum', 'ARRAY', 'Boolean', 'String', 'Integer',
                               'Numeric', 'Date', 'DateTime', 'Text'}
             if type_.__name__ in top_level_types:
                 pkgname = 'sqlalchemy'
@@ -460,23 +458,45 @@ class Relationship(object):
         return _re_invalid_relationship.sub('_', text + delimiter.join(args) + end)
 
     def make_backref(self, relationships, classes):
-        backref = self.backref_name
-        original_backref = backref
-        suffix = 0
-        while (self.target_cls, backref) in [(x.target_cls, x.backref_name) for x in relationships]:
-            backref = original_backref + str('_{0}'.format(suffix))
-            suffix += 1
-        self.kwargs['backref'] = repr(backref)
-        for rel in [x for x in relationships if 'backref' in x.kwargs]:
-            if self.target_cls in classes and rel.target_cls in classes:
-                if _is_model_descendant(classes[self.target_cls], classes[rel.target_cls]):
-                    self.backref_name = self.target_cls.lower() + '_' + backref
-                    self.kwargs['backref'] = repr(self.backref_name)
-                if _is_model_descendant(classes[rel.target_cls], classes[self.target_cls]):
-                    backref = rel.backref_name
-                    rel.backref_name = rel.target_cls.lower() + '_' + backref
-                    rel.kwargs['backref'] = repr(rel.backref_name)
+        """Generate a unique backref name based on source table and column role."""
+        # Base backref from source class
+        base_backref = _underscore(self.source_cls)  # e.g., 'pj_task' or 'assoc_rat_swarm'
 
+        if 'primaryjoin' in self.kwargs and not self.kwargs.get('secondary'):  # Many-to-one
+            # Extract FK column name from primaryjoin
+            join_str = self.kwargs['primaryjoin'].strip("'")
+            if ' == ' in join_str:
+                fk_part = join_str.split(' == ')[0]
+                col_name = fk_part.split('.')[-1]  # e.g., 'assigned_to_fk'
+                role = col_name.replace('_fk', '').replace('id_', '')  # e.g., 'assigned_to'
+                if role == 'parent':  # Self-referential
+                    backref_name = 'subtasks'
+                else:
+                    # Combine source table and role for uniqueness
+                    backref_name = f"{role}_{base_backref}s"  # e.g., 'assigned_to_pj_tasks'
+            else:
+                backref_name = f"{base_backref}_related"
+        elif 'secondary' in self.kwargs:  # Many-to-many
+            # Use secondary table name for context
+            secondary_table = self.kwargs['secondary'].strip("'").split('.')[-1]
+            backref_name = f"{base_backref}_{secondary_table}s"  # e.g., 'pj_task_assoc_table_items'
+        else:
+            backref_name = f"{base_backref}_related"
+
+        # Check for conflicts with existing backrefs or attributes
+        target_model = classes.get(self.target_cls)
+        existing_names = {r.backref_name for r in relationships if r.target_cls == self.target_cls}
+        if target_model:
+            existing_names.update(target_model.attributes.keys())  # Include target’s columns/relationships
+
+        original_backref = backref_name
+        suffix = 0
+        while backref_name in existing_names:
+            suffix += 1
+            backref_name = f"{original_backref}_{suffix}"
+
+        self.backref_name = backref_name
+        self.kwargs['backref'] = repr(backref_name)
 
 class ManyToOneRelationship(Relationship):
     def __init__(self, source_cls, target_cls, constraint, inflect_engine):
@@ -555,7 +575,7 @@ class CodeGenerator(object):
             global _dataclass
             _dataclass = True
 
-        self.enum_registry = {}
+        self.enum_registry = {}  # Maps (name, values) to generated name
         self.enum_counter = 0
 
         links = defaultdict(lambda: [])
@@ -603,6 +623,7 @@ class CodeGenerator(object):
                                     table.c[colname].type = Enum(*options, native_enum=False)
                                 continue
 
+            # Register enums for all columns
             for column in table.columns:
                 if isinstance(column.type, Enum) and column.type.enums and column.type.name:
                     enum_key = (column.type.name, tuple(column.type.enums))
@@ -612,8 +633,7 @@ class CodeGenerator(object):
                             self.enum_counter += 1
                             enum_name = f"{enum_name}_{self.enum_counter}"
                         self.enum_registry[enum_key] = enum_name
-                    column.type.name = self.enum_registry[enum_key]
-                elif (isinstance(column.type, ARRAY) and isinstance(column.type.item_type, Enum) and 
+                elif (isinstance(column.type, ARRAY) and isinstance(column.type.item_type, Enum) and
                       column.type.item_type.enums and column.type.item_type.name):
                     enum_key = (column.type.item_type.name, tuple(column.type.item_type.enums))
                     if enum_key not in self.enum_registry:
@@ -622,7 +642,6 @@ class CodeGenerator(object):
                             self.enum_counter += 1
                             enum_name = f"{enum_name}_{self.enum_counter}"
                         self.enum_registry[enum_key] = enum_name
-                    column.type.item_type.name = self.enum_registry[enum_key]
 
             if notables:
                 model = ModelClass(table, links[table.name], inflect_engine, not nojoined, self.collector, self)
@@ -661,38 +680,56 @@ class CodeGenerator(object):
             self.collector.add_literal_import('dataclasses', 'dataclass')
 
     def render(self, outfile=sys.stdout):
-        print(self.header, file=outfile)
-        print(self.collector.render() + '\n', file=outfile)
 
         if self.enum_registry:
-            print("from enum import Enum\n", file=outfile)
-            for (enum_name, enum_values), generated_name in self.enum_registry.items():
-                print(f"class {generated_name}(Enum):", file=outfile)
+            for (enum_name, enum_values), generated_name in sorted(self.enum_registry.items()):
                 for value in enum_values:
-                    safe_name = _convert_to_valid_identifier(value)
-                    print(f"    {safe_name} = {repr(value)}", file=outfile)
-                print("", file=outfile)
+                    # Force variable name to UPPERCASE, sanitize spaces/hyphens
+                    safe_name = value.replace(' ', '_').replace('-', '_').upper()
+                    if safe_name[0].isdigit() or iskeyword(safe_name):
+                        safe_name = '_' + safe_name
 
         if self.flask:
-            print('db = SQLAlchemy()', file=outfile)
         else:
             if any(isinstance(model, ModelClass) for model in self.models):
-                print('Base = declarative_base()\nmetadata = Base.metadata', file=outfile)
             else:
-                print('metadata = MetaData()', file=outfile)
 
         for model in self.models:
-            print('\n\n', file=outfile)
-            print(model.render().rstrip('\n'), file=outfile)
 
         if self.footer:
-            print(self.footer, file=outfile)
-
 
 if __name__ == "__main__":
-    from sqlalchemy import MetaData, Table, Column, Integer
+    from sqlalchemy import MetaData, Table, Column, Integer, String, DateTime, Numeric, Date
     metadata = MetaData()
-    test_table = Table('test', metadata,
-                       Column('id', Integer, primary_key=True))
+
+    # Define sample tables to test PjTask-like scenario
+    user_ext = Table('user_ext', metadata,
+                     Column('id', Integer, primary_key=True))
+
+    project = Table('project', metadata,
+                    Column('id', Integer, primary_key=True))
+
+    pj_tasks = Table('pj_tasks', metadata,
+                     Column('task_id', Integer, primary_key=True, server_default=sqlalchemy.schema.FetchedValue()),
+                     Column('project_id_fk', Integer, ForeignKey('project.id'), nullable=False),
+                     Column('parent_task_id_fk', Integer, ForeignKey('pj_tasks.task_id')),
+                     Column('task_name', String(100), nullable=False),
+                     Column('description', String),
+                     Column('status', Enum('Initiated', 'Planned', 'In_Progress', name='task_status'), nullable=False,
+                            server_default='Initiated'),
+                     Column('priority', Enum('Low', 'Medium', 'High', 'Critical', name='task_priority'),
+                            server_default='Medium'),
+                     Column('story_points', Integer),
+                     Column('progress', Numeric(5, 2), server_default='0.00'),
+                     Column('assigned_to_fk', Integer, ForeignKey('user_ext.id'), nullable=False),
+                     Column('created_by_fk', Integer, ForeignKey('user_ext.id'), nullable=False),
+                     Column('updated_by_fk', Integer, ForeignKey('user_ext.id')),
+                     Column('start_date', Date),
+                     Column('end_date', Date),
+                     Column('actual_start_date', Date),
+                     Column('actual_end_date', Date),
+                     Column('created_at', DateTime, server_default=sqlalchemy.schema.FetchedValue()),
+                     Column('updated_at', DateTime, server_default=sqlalchemy.schema.FetchedValue()))
+
     generator = CodeGenerator(metadata, flask=True)
     generator.render()
