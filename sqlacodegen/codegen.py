@@ -245,6 +245,8 @@ def _is_model_descendant(model_a, model_b):
 def _render_index(index):
     prepend = 'db.' if hasattr(index.table, '_codegen') and index.table._codegen.flask else ''
     columns = [repr(col.name) for col in index.columns]
+    if index.unique:
+        return prepend + 'UniqueConstraint({0}, name={1!r}'.format(', '.join(columns), index.name)
     return prepend + 'Index({0!r}, {1})'.format(index.name, ', '.join(columns))
 
 
