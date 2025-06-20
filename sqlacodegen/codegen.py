@@ -142,6 +142,7 @@ def _getargspec_init(method):
                 "ArgSpec", (), {"args": ["self", "*args", "**kwargs"], "defaults": None}
             )()
 
+
 def _render_column_type(codegen, coltype):
     prepend = "db." if codegen.flask else "sa."
     args = []
@@ -169,9 +170,7 @@ def _render_column_type(codegen, coltype):
             python_enum_class_name = codegen.enum_registry[sql_enum_key]
 
             rendered_sqla_enum = f"{prepend}Enum(*{python_enum_class_name}_values, name='{enum_to_render_as_python_class.name}'"
-            if not getattr(
-                enum_to_render_as_python_class, "native_enum", True
-            ):
+            if not getattr(enum_to_render_as_python_class, "native_enum", True):
                 rendered_sqla_enum += ", native_enum=False"
             if (
                 getattr(enum_to_render_as_python_class, "create_constraint", True)
@@ -186,12 +185,8 @@ def _render_column_type(codegen, coltype):
             rendered_sqla_enum += ")"
 
             if is_array_of_enum:
-                array_args = [
-                    rendered_sqla_enum
-                ]
-                if (
-                    getattr(coltype, "dimensions", None) is not None
-                ):
+                array_args = [rendered_sqla_enum]
+                if getattr(coltype, "dimensions", None) is not None:
                     array_args.append(f"dimensions={coltype.dimensions}")
                 return f"{prepend}ARRAY({', '.join(array_args)})"
             else:
@@ -204,9 +199,7 @@ def _render_column_type(codegen, coltype):
     missing = object()
     use_kwargs = False
 
-    is_generic_enum_rendering = isinstance(
-        coltype, Enum
-    )
+    is_generic_enum_rendering = isinstance(coltype, Enum)
 
     for attr in argspec.args[1:]:
         if attr.startswith("_"):
@@ -236,82 +229,34 @@ def _render_column_type(codegen, coltype):
     return text
 
 
-def _render_server_default_expr(codegen, server_default_obj, column_type_py):
+def _render_server_default_expr(codegen, server_default_obj, column):
     """
     Render server default in a way that Alembic can understand and reproduce.
     Returns the Python code string FOR THE VALUE of the server_default parameter.
-    e.g., "sa.false()", "sa.func.now()", "True", "'default_string'", "sa.text(...)"
-    Returns None if no specific server default should be rendered (e.g. rely on FetchedValue or omit).
     """
     prepend = "db." if codegen.flask else "sa."
 
-    if not hasattr(server_default_obj, "arg"):
-        if server_default_obj is None or (
-            hasattr(server_default_obj, "arg") and server_default_obj.arg is None
+    if not hasattr(server_default_obj, "arg") or server_default_obj.arg is None:
+        if (
+            column.primary_key
+            and isinstance(column.type, (sqlalchemy.Integer, sqlalchemy.BigInteger))
+            and column.autoincrement == True
         ):
             return None
         return f"{prepend}FetchedValue()"
 
     default_arg = server_default_obj.arg
 
-    if isinstance(default_arg, TextClause):
-        default_text = default_arg.text.strip()
-
-        if (
-            default_text.lower() == "now()"
-            or default_text.lower() == "current_timestamp"
-        ):
-            codegen.collector.add_import(func)
-            return f"{prepend}func.now()"
-
-        if column_type_py is bool or isinstance(
-            column_type_py, sqlalchemy.types.Boolean
-        ):
-            if default_text.lower() == "true":
-                codegen.collector.add_import(sa_true)
-                return f"{prepend}true()"
-            elif default_text.lower() == "false":
-                codegen.collector.add_import(sa_false)
-                return f"{prepend}false()"
-
-        if (
-            default_text.lower().startswith("nextval(")
-            and "::regclass" in default_text.lower()
-        ):
-            if (
-                not column_type_py.primary_key
-            ):
-                codegen.collector.add_import(sa_text)
-                return f"{prepend}text({repr(default_text)})"
-            else:
-                return None
-
-        if (
-            default_text.startswith("'")
-            and default_text.endswith("'")
-            and default_text.count("'") == 2
-        ):
-            return repr(
-                default_text[1:-1]
-            )
-
-        try:
-            if "." in default_text:
-                float(default_text)
-                return default_text
-            else:
-                int(default_text)
-                return default_text
-        except ValueError:
-            codegen.collector.add_import(sa_text)
-            return f"{prepend}text({repr(default_text)})"
-
-    elif isinstance(
-        default_arg, sqlalchemy.sql.functions.FunctionElement
-    ):
+    if isinstance(default_arg, sqlalchemy.sql.functions.FunctionElement):
         if default_arg.name.lower() in ("now", "current_timestamp"):
             codegen.collector.add_import(func)
             return f"{prepend}func.now()"
+        elif default_arg.name.lower() == "current_date":
+            codegen.collector.add_import(func)
+            return f"{prepend}func.current_date()"
+        elif default_arg.name.lower() == "current_time":
+            codegen.collector.add_import(func)
+            return f"{prepend}func.current_time()"
         try:
             compiled_default = str(
                 default_arg.compile(compile_kwargs={"literal_binds": True})
@@ -319,22 +264,54 @@ def _render_server_default_expr(codegen, server_default_obj, column_type_py):
             codegen.collector.add_import(sa_text)
             return f"{prepend}text({repr(compiled_default)})"
         except Exception:
+            return f"{prepend}FetchedValue()"
+
+    if isinstance(default_arg, TextClause):
+        default_text = default_arg.text.strip()
+
+        if isinstance(column.type, sqlalchemy.types.Boolean):
+            if default_text.lower() == "true" or default_text == "1":
+                codegen.collector.add_import(sa_text)
+                return f"{prepend}text('true')"
+            elif default_text.lower() == "false" or default_text == "0":
+                codegen.collector.add_import(sa_text)
+                return f"{prepend}text('false')"
+
+        try:
+            if default_text.replace(".", "", 1).replace("-", "", 1).isdigit():
+                codegen.collector.add_import(sa_text)
+                return f"{prepend}text({repr(default_text)})"
+        except ValueError:
             pass
 
-    elif isinstance(default_arg, str):
+        if (
+            default_text.startswith("'")
+            and default_text.endswith("'")
+            and default_text.count("'") == 2
+            and "::" not in default_text
+        ):
+            return repr(default_text[1:-1])
+
+        codegen.collector.add_import(sa_text)
+        return f"{prepend}text({repr(default_text)})"
+
+    if isinstance(default_arg, str):
         return repr(default_arg)
-    elif isinstance(default_arg, bool):
-        return str(default_arg)
+    elif default_arg is True:
+        codegen.collector.add_import(sa_text)
+        return f"{prepend}text('true')"
+    elif default_arg is False:
+        codegen.collector.add_import(sa_text)
+        return f"{prepend}text('false')"
     elif isinstance(default_arg, (int, float)):
-        return str(default_arg)
+        codegen.collector.add_import(sa_text)
+        return f"{prepend}text('{str(default_arg)}')"
 
     codegen.collector.add_import(FetchedValue)
     return f"{prepend}FetchedValue()"
 
 
-def _render_column(
-    self, column, show_name
-):
+def _render_column(self, column, show_name):
     codegen = self.codegen
     prepend = "db." if codegen.flask else "sa."
 
@@ -346,9 +323,7 @@ def _render_column(
     args.append(_render_column_type(codegen, column.type))
 
     for fk_obj in column.foreign_keys:
-        args.append(
-            _render_constraint(fk_obj)
-        )
+        args.append(_render_constraint(fk_obj))
 
     kwargs_list = []
 
@@ -364,20 +339,52 @@ def _render_column(
     elif column.nullable is True and is_sole_pk:
         kwargs_list.append("nullable=True")
 
+    has_table_level_single_col_uc = False
+    for constr in column.table.constraints:
+        if (
+            isinstance(constr, UniqueConstraint)
+            and len(constr.columns) == 1
+            and constr.columns[0].name == column.name
+        ):
+            has_table_level_single_col_uc = True
+            break
+
+    has_table_level_single_col_unique_idx = False
+    for idx in column.table.indexes:
+        if idx.unique and len(idx.columns) == 1 and idx.columns[0].name == column.name:
+            has_table_level_single_col_unique_idx = True
+            break
+
     if getattr(column, "unique", False):
-        kwargs_list.append("unique=True")
-    elif getattr(column, "index", False) and not getattr(
-        column, "unique", False
+        if (
+            not has_table_level_single_col_uc
+            and not has_table_level_single_col_unique_idx
+        ):
+            kwargs_list.append("unique=True")
+
+    elif (
+        getattr(column, "index", False)
+        and not getattr(column, "unique", False)
+        and not has_table_level_single_col_uc
+        and not has_table_level_single_col_unique_idx
     ):
-        kwargs_list.append("index=True")
+        has_table_level_single_col_idx = False
+        for idx in column.table.indexes:
+            if (
+                not idx.unique
+                and len(idx.columns) == 1
+                and idx.columns[0].name == column.name
+            ):
+                has_table_level_single_col_idx = True
+                break
+        if not has_table_level_single_col_idx:
+            kwargs_list.append("index=True")
 
     if column.server_default:
         default_value_expr = _render_server_default_expr(
             codegen, column.server_default, column
         )
-        if (
-            default_value_expr
-        ):
+        if default_value_expr:
             kwargs_list.append(f"server_default={default_value_expr}")
 
     if hasattr(column, "comment") and column.comment and not codegen.nocomments:
@@ -388,9 +395,7 @@ def _render_column(
         and column.info.get("description")
         and not codegen.nocomments
     ):
-        if not (
-            hasattr(column, "comment") and column.comment
-        ):
+        if not (hasattr(column, "comment") and column.comment):
             kwargs_list.append(f'comment={repr(column.info["description"])}')
 
     args.extend(kwargs_list)
@@ -571,12 +576,8 @@ class Model(object):
         super(Model, self).__init__()
         self.table = table
         self.schema = table.schema
-        self.codegen = (
-            codegen
-        )
-        self.table._codegen = (
-            codegen
-        )
+        self.codegen = codegen
+        self.table._codegen = codegen
 
         for column in table.columns:
             cls = column.type.__class__
@@ -595,9 +596,7 @@ class Model(object):
             collector.add_import(Column)
         for column in self.table.columns:
             collector.add_import(column.type)
-            if isinstance(
-                column.type, ARRAY
-            ):
+            if isinstance(column.type, ARRAY):
                 collector.add_import(ARRAY)
             if column.server_default:
                 pass
@@ -609,9 +608,7 @@ class Model(object):
             elif isinstance(constraint, UniqueConstraint):
                 if len(constraint.columns) > 1:
                     collector.add_import(UniqueConstraint)
-            elif not isinstance(
-                constraint, PrimaryKeyConstraint
-            ):
+            elif not isinstance(constraint, PrimaryKeyConstraint):
                 collector.add_import(constraint)
 
         for index in self.table.indexes:
@@ -630,9 +627,7 @@ class ModelTable(Model):
 
     def render(self):
         prepend = "db." if self.codegen.flask else ""
-        met = (
-            " metadata," if not self.codegen.flask else ""
-        )
+        met = " metadata," if not self.codegen.flask else ""
         if not self.codegen.flask and prepend == "":
             prepend = "sa."
 
@@ -715,7 +710,6 @@ class ModelClass(Model):
                     target_table.name, inflect_engine
                 )
 
-
                 is_joined_inheritance = (
                     detect_joined
                     and self.parent_name in ("Base", "db.Model")
@@ -731,9 +725,7 @@ class ModelClass(Model):
                     )
                     self._add_attribute(relationship_.preferred_name, relationship_)
 
-        for (
-            association_table_obj
-        ) in association_tables:
+        for association_table_obj in association_tables:
             fk_constraints = [
                 c
                 for c in association_table_obj.constraints
@@ -791,8 +783,10 @@ class ModelClass(Model):
     def render(self):
         global _dataclass
         text = "class {0}({1}):\n".format(self.name, self.parent_name)
+
         if _dataclass:
             text = "@dataclass\n" + text
+
         text += "    __tablename__ = {0!r}\n".format(self.table.name)
 
         table_args_list = []
@@ -804,33 +798,35 @@ class ModelClass(Model):
                 and len(constraint.columns) == 1
             ):
                 continue
+
             if (
                 isinstance(constraint, UniqueConstraint)
                 and len(constraint.columns) == 1
             ):
-                col_is_unique_on_column_def = getattr(
-                    constraint.columns[0], "unique", False
-                )
-                if col_is_unique_on_column_def:
-                    continue
+                column_obj = constraint.columns[0]
+                if getattr(column_obj, "unique", False):
+                    if not constraint.name and getattr(column_obj, "unique", False):
+                        continue
             table_args_list.append(_render_constraint(constraint))
 
-        for index in self.table.indexes:
-            if len(index.columns) > 1 or (
-                len(index.columns) == 1
-                and not (
-                    getattr(index.columns[0], "index", False)
-                    or getattr(index.columns[0], "unique", False)
-                )
-            ):
-                table_args_list.append(
-                    _render_index(index)
-                )
+        for index_obj in self.table.indexes:
+            if len(index_obj.columns) > 1:
+                table_args_list.append(_render_index(index_obj))
+            elif len(index_obj.columns) == 1:
+                column_obj = index_obj.columns[0]
+                is_already_on_column = False
+                if index_obj.unique:
+                    if getattr(column_obj, "unique", False):
+                        is_already_on_column = True
+                elif getattr(column_obj, "index", False):
+                    is_already_on_column = True
+
+                if not is_already_on_column:
+                    table_args_list.append(_render_index(index_obj))
 
         table_kwargs_dict = {}
         if self.schema:
             table_kwargs_dict["schema"] = self.schema
-
         if (
             hasattr(self.table, "comment")
             and self.table.comment
@@ -839,24 +835,23 @@ class ModelClass(Model):
             table_kwargs_dict["comment"] = self.table.comment
 
         if table_args_list or table_kwargs_dict:
-            rendered_args = []
-            rendered_args.extend(table_args_list)
+            rendered_args_for_tuple = []
+            rendered_args_for_tuple.extend(table_args_list)
+
             if table_kwargs_dict:
                 kwargs_str_parts = [
                     f"{repr(k)}: {repr(v)}"
                     for k, v in sorted(table_kwargs_dict.items())
                 ]
-                rendered_args.append(f"{{{', '.join(kwargs_str_parts)}}}")
+                rendered_args_for_tuple.append(f"{{{', '.join(kwargs_str_parts)}}}")
 
-            if rendered_args:
-                final_args_str = ",\n        ".join(rendered_args)
-                if len(rendered_args) == 1 and not final_args_str.endswith(
-                    ","
+            if rendered_args_for_tuple:
+                final_args_str = ",\n        ".join(rendered_args_for_tuple)
+                if len(rendered_args_for_tuple) == 1 and not (
+                    rendered_args_for_tuple[0].startswith("{")
+                    and rendered_args_for_tuple[0].endswith("}")
                 ):
-                    if not (
-                        final_args_str.startswith("{") and final_args_str.endswith("}")
-                    ):
-                        final_args_str += ","
+                    final_args_str += ","
                 text += "    __table_args__ = (\n        {0}\n    )\n".format(
                     final_args_str
                 )
@@ -906,9 +901,7 @@ class Relationship(object):
 
         rendered_kwargs = []
         for key, value in self.kwargs.items():
-            rendered_kwargs.append(
-                f"{key}={value}"
-            )
+            rendered_kwargs.append(f"{key}={value}")
 
         args.extend(rendered_kwargs)
 
@@ -923,9 +916,7 @@ class Relationship(object):
     def make_backref(self, relationships, classes):
         target_class_model = classes.get(self.target_cls)
 
-        base_backref_candidate = _underscore(
-            self.backref_name
-        )
+        base_backref_candidate = _underscore(self.backref_name)
         current_backref = base_backref_candidate
         suffix_num = 0
 
@@ -944,12 +935,8 @@ class Relationship(object):
             suffix_num += 1
             current_backref = f"{base_backref_candidate}_{suffix_num}"
 
-        self.backref_name = (
-            current_backref
-        )
-        self.kwargs["backref"] = repr(
-            current_backref
-        )
+        self.backref_name = current_backref
+        self.kwargs["backref"] = repr(current_backref)
 
 
 class ManyToOneRelationship(Relationship):
@@ -957,21 +944,27 @@ class ManyToOneRelationship(Relationship):
         super(ManyToOneRelationship, self).__init__(source_cls, target_cls)
         self._codegen = constraint.table._codegen
 
-        column_names = _get_column_names(constraint)
-        colname_on_source_table = column_names[0]
+        local_fk_column_names = [col.name for col in constraint.columns]
+        first_local_fk_col_name = local_fk_column_names[0]
 
-        if colname_on_source_table.endswith("_id") or colname_on_source_table.endswith(
-            "_fk"
-        ):
-            base_name = re.sub(r"(_id|_fk)$", "", colname_on_source_table)
-            self.preferred_name = inflect_engine.singular_noun(base_name) or base_name
+        if source_cls == target_cls:
+            self.preferred_name = "parent"
         else:
-            target_table_name = constraint.elements[0].column.table.name
-            self.preferred_name = (
-                inflect_engine.singular_noun(target_table_name) or target_table_name
-            )
+            if first_local_fk_col_name.endswith(
+                "_id"
+            ) or first_local_fk_col_name.endswith("_fk"):
+                base_name = re.sub(r"(_id|_fk)$", "", first_local_fk_col_name)
+                self.preferred_name = (
+                    inflect_engine.singular_noun(base_name) or base_name
+                )
+            else:
+                target_table_name_from_fk = constraint.elements[0].column.table.name
+                self.preferred_name = (
+                    inflect_engine.singular_noun(target_table_name_from_fk)
+                    or target_table_name_from_fk
+                )
 
-        local_fk_columns_set = set(col.name for col in constraint.columns)
+        local_fk_columns_set = set(local_fk_column_names)
         if (
             constraint.table.primary_key
             and set(pk_col.name for pk_col in constraint.table.primary_key.columns)
@@ -988,40 +981,28 @@ class ManyToOneRelationship(Relationship):
                     self.kwargs["uselist"] = "False"
                     break
 
-        if source_cls == target_cls:
-            self.preferred_name = (
-                "parent"
-                if self.kwargs.get("uselist") == "False"
-                else "children_relationship"
-            )
-
-            pk_cols_on_target_repr = [
-                f"{target_cls}.{pk_col.name}"
-                for pk_col in constraint.elements[0].column.table.primary_key
-            ]
-            if len(pk_cols_on_target_repr) == 1:
-                self.kwargs["remote_side"] = (
-                    f"[{repr(pk_cols_on_target_repr[0])}]"
-                )
-            else:
-                self.kwargs["remote_side"] = repr(
-                    pk_cols_on_target_repr
-                )
-
         join_conditions = []
         for i, fk_element in enumerate(constraint.elements):
-            local_col_name = constraint.columns[
-                i
-            ].name
-            remote_col_name = fk_element.column.name
+            local_col_name_on_source = constraint.columns[i].name
+            remote_col_name_on_target = fk_element.column.name
             join_conditions.append(
-                f"{source_cls}.{local_col_name} == {target_cls}.{remote_col_name}"
+                f"{source_cls}.{local_col_name_on_source} == {target_cls}.{remote_col_name_on_target}"
             )
 
         if len(join_conditions) > 1:
             self.kwargs["primaryjoin"] = repr(f"and_({', '.join(join_conditions)})")
         else:
             self.kwargs["primaryjoin"] = repr(join_conditions[0])
+
+        if source_cls == target_cls:
+            parent_pk_cols_expressions = [
+                f"{target_cls}.{pk_col.name}"
+                for pk_col in constraint.elements[0].column.table.primary_key
+            ]
+            if len(parent_pk_cols_expressions) == 1:
+                self.kwargs["remote_side"] = repr(parent_pk_cols_expressions[0])
+            else:
+                self.kwargs["remote_side"] = repr(parent_pk_cols_expressions)
 
 
 class ManyToManyRelationship(Relationship):
@@ -1036,9 +1017,7 @@ class ManyToManyRelationship(Relationship):
         )
         self.kwargs["secondary"] = repr(prefix + association_table.name)
 
-        self.preferred_name = inflect_engine.plural_noun(
-            target_cls.lower()
-        )
+        self.preferred_name = inflect_engine.plural_noun(target_cls.lower())
         if not self.preferred_name:
             self.preferred_name = target_cls.lower() + "_collection"
 
@@ -1047,9 +1026,7 @@ class ManyToManyRelationship(Relationship):
             for c in association_table.constraints
             if isinstance(c, ForeignKeyConstraint)
         ]
-        fk_constraints.sort(
-            key=lambda fk: fk.elements[0].column.table.name
-        )
+        fk_constraints.sort(key=lambda fk: fk.elements[0].column.table.name)
 
         fk_to_source_table = None
         fk_to_target_table = None
@@ -1077,12 +1054,8 @@ class ManyToManyRelationship(Relationship):
         if fk_to_source_table:
             pri_join_conds = []
             for i, elem in enumerate(fk_to_source_table.elements):
-                source_table_pk_col_name = (
-                    elem.column.name
-                )
-                assoc_table_fk_col_name = fk_to_source_table.columns[
-                    i
-                ].name
+                source_table_pk_col_name = elem.column.name
+                assoc_table_fk_col_name = fk_to_source_table.columns[i].name
                 pri_join_conds.append(
                     f"{source_cls}.{source_table_pk_col_name} == {association_table.name}.c.{assoc_table_fk_col_name}"
                 )
@@ -1095,12 +1068,8 @@ class ManyToManyRelationship(Relationship):
         if fk_to_target_table:
             sec_join_conds = []
             for i, elem in enumerate(fk_to_target_table.elements):
-                target_table_pk_col_name = (
-                    elem.column.name
-                )
-                assoc_table_fk_col_name = fk_to_target_table.columns[
-                    i
-                ].name
+                target_table_pk_col_name = elem.column.name
+                assoc_table_fk_col_name = fk_to_target_table.columns[i].name
                 sec_join_conds.append(
                     f"{target_cls}.{target_table_pk_col_name} == {association_table.name}.c.{assoc_table_fk_col_name}"
                 )
@@ -1152,12 +1121,8 @@ class CodeGenerator(object):
             global _dataclass
             _dataclass = True
 
-        self.enum_registry = (
-            {}
-        )
-        self.py_enum_definitions = (
-            OrderedDict()
-        )
+        self.enum_registry = {}
+        self.py_enum_definitions = OrderedDict()
         self.enum_counter = 0
 
         links = defaultdict(list)
@@ -1190,20 +1155,14 @@ class CodeGenerator(object):
                     for fk_c in fk_constraints:
                         for col in fk_c.columns:
                             fk_col_names_in_pks.add(col.name)
-                    if (
-                        fk_col_names_in_pks != pk_col_names
-                    ):
+                    if fk_col_names_in_pks != pk_col_names:
                         is_pure_association = False
 
-            if (
-                is_pure_association and len(fk_constraints) >= 2
-            ):
+            if is_pure_association and len(fk_constraints) >= 2:
                 association_table_names.add(table_name)
                 for fk_c in fk_constraints:
                     referred_table_name = fk_c.elements[0].column.table.name
-                    if (
-                        referred_table_name != table_name
-                    ):
+                    if referred_table_name != table_name:
                         links[referred_table_name].append(table_obj)
 
         self.models = []
@@ -1221,9 +1180,7 @@ class CodeGenerator(object):
             if self.dataclass:
                 self.collector.add_literal_import("dataclasses", "dataclass")
 
-        self.classes = (
-            {}
-        )
+        self.classes = {}
 
         sorted_tables = sorted(
             metadata.tables.values(), key=lambda t: (t.schema or "", t.name)
@@ -1232,12 +1189,8 @@ class CodeGenerator(object):
         for table in sorted_tables:
             if table.name in ("alembic_version", "migrate_version"):
                 continue
-            if (
-                table.name in association_table_names and not notables
-            ):
-                if (
-                    notables
-                ):
+            if table.name in association_table_names and not notables:
+                if notables:
                     model = ModelTable(table, self)
                     self.models.append(model)
                     model.add_imports(self.collector)
@@ -1255,9 +1208,7 @@ class CodeGenerator(object):
 
             if notables:
                 model = ModelTable(table, self)
-            elif (
-                noclasses or not table.primary_key
-            ):
+            elif noclasses or not table.primary_key:
                 model = ModelTable(table, self)
             else:
                 relevant_assoc_tables = [
@@ -1278,9 +1229,7 @@ class CodeGenerator(object):
             model.add_imports(self.collector)
 
         if not notables and not noclasses:
-            for model_class_instance in list(
-                self.models
-            ):
+            for model_class_instance in list(self.models):
                 if isinstance(
                     model_class_instance, ModelClass
                 ) and model_class_instance.parent_name not in ("Base", "db.Model"):
@@ -1289,12 +1238,8 @@ class CodeGenerator(object):
                     )
                     if parent_class_model:
                         parent_class_model.children.append(model_class_instance)
-                        if (
-                            model_class_instance in self.models
-                        ):
-                            self.models.remove(
-                                model_class_instance
-                            )
+                        if model_class_instance in self.models:
+                            self.models.remove(model_class_instance)
 
             if not nobackrefs:
                 all_relationships = []
@@ -1304,9 +1249,7 @@ class CodeGenerator(object):
                             all_relationships.append(attr_value)
 
                 for rel in all_relationships:
-                    rel.make_backref(
-                        all_relationships, self.classes
-                    )
+                    rel.make_backref(all_relationships, self.classes)
 
     def _process_column_enum_type(self, column):
         """Helper to process Enum types on columns and register them for Python class generation."""
@@ -1319,20 +1262,14 @@ class CodeGenerator(object):
             sql_enum_object_to_process = coltype.item_type
 
         if sql_enum_object_to_process and sql_enum_object_to_process.enums:
-            actual_sql_enum_name_from_db = (
-                sql_enum_object_to_process.name
-            )
-            if (
-                not actual_sql_enum_name_from_db
-            ):
+            actual_sql_enum_name_from_db = sql_enum_object_to_process.name
+            if not actual_sql_enum_name_from_db:
                 return
 
             python_enum_class_name_to_generate = _convert_to_valid_identifier(
                 actual_sql_enum_name_from_db
             )
-            if (
-                not python_enum_class_name_to_generate
-            ):
+            if not python_enum_class_name_to_generate:
                 self.enum_counter += 1
                 python_enum_class_name_to_generate = f"EnumType{self.enum_counter}"
 
@@ -1358,9 +1295,7 @@ class CodeGenerator(object):
                 self.py_enum_definitions[final_python_class_name] = list(
                     sql_enum_object_to_process.enums
                 )
-                self.collector.add_literal_import(
-                    "enum", "Enum"
-                )
+                self.collector.add_literal_import("enum", "Enum")
 
     def render(self, outfile=sys.stdout):
         print(self.header, file=outfile)
@@ -1369,7 +1304,6 @@ class CodeGenerator(object):
             self.collector.add_literal_import("enum", "Enum")
 
         rendered_imports = self.collector.render()
-
 
         final_imports_to_print = rendered_imports
         enum_class_to_use_in_def = "Enum"
@@ -1397,12 +1331,8 @@ class CodeGenerator(object):
                         self.collector["enum"].remove("Enum")
                         if not self.collector["enum"]:
                             del self.collector["enum"]
-                    final_imports_to_print = (
-                        self.collector.render()
-                    )
-                    if (
-                        self.py_enum_definitions
-                    ):
+                    final_imports_to_print = self.collector.render()
+                    if self.py_enum_definitions:
                         print("from enum import Enum as PyEnum\n", file=outfile)
                         enum_class_to_use_in_def = "PyEnum"
             elif "from enum import Enum as PyEnum" in final_imports_to_print:
