@@ -236,14 +236,23 @@ def _render_server_default_expr(codegen, server_default_obj, column):
     """
     prepend = "db." if codegen.flask else "sa."
 
+    if hasattr(column, 'identity') and column.identity is not None and column.primary_key:
+        return None
+
     if not hasattr(server_default_obj, "arg") or server_default_obj.arg is None:
         if (
             column.primary_key
             and isinstance(column.type, (sqlalchemy.Integer, sqlalchemy.BigInteger))
-            and column.autoincrement == True
+            and (column.autoincrement is True or str(column.autoincrement).lower() == 'auto')
+            and not (hasattr(column, 'identity') and column.identity is not None)
         ):
             return None
-        return f"{prepend}FetchedValue()"
+
+        if isinstance(server_default_obj, FetchedValue):
+             codegen.collector.add_import(FetchedValue)
+             return f"{prepend}FetchedValue()"
+        return None
+
 
     default_arg = server_default_obj.arg
 
@@ -264,7 +273,9 @@ def _render_server_default_expr(codegen, server_default_obj, column):
             codegen.collector.add_import(sa_text)
             return f"{prepend}text({repr(compiled_default)})"
         except Exception:
+            codegen.collector.add_import(FetchedValue)
             return f"{prepend}FetchedValue()"
+
 
     if isinstance(default_arg, TextClause):
         default_text = default_arg.text.strip()
@@ -278,19 +289,9 @@ def _render_server_default_expr(codegen, server_default_obj, column):
                 return f"{prepend}text('false')"
 
         try:
-            if default_text.replace(".", "", 1).replace("-", "", 1).isdigit():
-                codegen.collector.add_import(sa_text)
-                return f"{prepend}text({repr(default_text)})"
+            pass
         except ValueError:
             pass
-
-        if (
-            default_text.startswith("'")
-            and default_text.endswith("'")
-            and default_text.count("'") == 2
-            and "::" not in default_text
-        ):
-            return repr(default_text[1:-1])
 
         codegen.collector.add_import(sa_text)
         return f"{prepend}text({repr(default_text)})"
@@ -310,7 +311,6 @@ def _render_server_default_expr(codegen, server_default_obj, column):
     codegen.collector.add_import(FetchedValue)
     return f"{prepend}FetchedValue()"
 
-
 def _render_column(self, column, show_name):
     codegen = self.codegen
     prepend = "db." if codegen.flask else "sa."
@@ -325,18 +325,37 @@ def _render_column(self, column, show_name):
     for fk_obj in column.foreign_keys:
         args.append(_render_constraint(fk_obj))
 
+    is_identity_column = hasattr(column, 'identity') and column.identity is not None
+
+    if is_identity_column:
+        codegen.collector.add_import(sqlalchemy.Identity)
+
+        identity_params = []
+        identity_constructor_attrs = ['start', 'increment', 'minvalue', 'maxvalue', 'cycle', 'cache', 'order']
+
+        for attr_name in identity_constructor_attrs:
+            if hasattr(column.identity, attr_name):
+                value = getattr(column.identity, attr_name)
+                if value is not None:
+                    if attr_name == 'cycle' and value is False and column.identity.start is None:
+                        pass
+                    else:
+                        identity_params.append(f"{attr_name}={repr(value)}")
+
+        rendered_identity_params = ", ".join(identity_params)
+        args.append(f"{prepend}Identity({rendered_identity_params})")
+
     kwargs_list = []
 
     if hasattr(column, "key") and column.key != column.name:
         kwargs_list.append(f"key='{column.key}'")
 
-    is_sole_pk = column.primary_key and len(column.table.primary_key.columns) == 1
     if column.primary_key:
         kwargs_list.append("primary_key=True")
 
-    if column.nullable is False and not is_sole_pk:
+    if column.nullable is False and not column.primary_key:
         kwargs_list.append("nullable=False")
-    elif column.nullable is True and is_sole_pk:
+    elif column.nullable is True and column.primary_key:
         kwargs_list.append("nullable=True")
 
     has_table_level_single_col_uc = False
@@ -355,7 +374,7 @@ def _render_column(self, column, show_name):
             has_table_level_single_col_unique_idx = True
             break
 
-    if getattr(column, "unique", False):
+    if getattr(column, "unique", False) and not column.primary_key:
         if (
             not has_table_level_single_col_uc
             and not has_table_level_single_col_unique_idx
@@ -365,8 +384,7 @@ def _render_column(self, column, show_name):
     elif (
         getattr(column, "index", False)
         and not getattr(column, "unique", False)
-        and not has_table_level_single_col_uc
-        and not has_table_level_single_col_unique_idx
+        and not column.primary_key
     ):
         has_table_level_single_col_idx = False
         for idx in column.table.indexes:
@@ -380,12 +398,20 @@ def _render_column(self, column, show_name):
         if not has_table_level_single_col_idx:
             kwargs_list.append("index=True")
 
-    if column.server_default:
+    if column.server_default and not is_identity_column:
         default_value_expr = _render_server_default_expr(
             codegen, column.server_default, column
         )
         if default_value_expr:
             kwargs_list.append(f"server_default={default_value_expr}")
+
+    if not is_identity_column:
+        if column.primary_key and isinstance(column.type, (sqlalchemy.Integer, sqlalchemy.BigInteger)):
+            if column.autoincrement is False:
+                kwargs_list.append("autoincrement=False")
+        elif column.autoincrement is True and not column.primary_key:
+            kwargs_list.append("autoincrement=True")
+
 
     if hasattr(column, "comment") and column.comment and not codegen.nocomments:
         kwargs_list.append(f"comment={repr(column.comment)}")
@@ -400,7 +426,6 @@ def _render_column(self, column, show_name):
 
     args.extend(kwargs_list)
     return f"{prepend}Column({', '.join(args)})"
-
 
 def _render_constraint(constraint):
     if isinstance(constraint, ForeignKey):
@@ -550,6 +575,7 @@ class ImportCollector(OrderedDict):
                 "false",
                 "func",
                 "text",
+                "Identity",
             }
             if type_.__name__ in top_level_types:
                 pkgname = "sqlalchemy"
